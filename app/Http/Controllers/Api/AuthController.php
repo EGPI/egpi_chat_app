@@ -76,6 +76,21 @@ class AuthController extends Controller
         ]);
     }
 
+    public function me(Request $request): JsonResponse
+{
+    $user = $request->user();
+
+    if (! $user->is_active) {
+        return response()->json([
+            'message' => 'Your account is inactive.',
+        ], 403);
+    }
+
+    return response()->json([
+        'user' => $this->userResponse($user),
+    ]);
+}
+
     private function userResponse(User $user): array
     {
         return [
