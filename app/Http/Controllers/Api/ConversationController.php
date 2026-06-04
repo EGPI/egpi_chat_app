@@ -6,6 +6,9 @@ use App\Http\Controllers\Controller;
 use App\Models\Conversation;
 use App\Models\ConversationParticipant;
 use App\Models\User;
+use App\Services\ChatSyncEventBroadcaster;
+use App\Services\ConversationSyncPayload;
+use Carbon\CarbonInterface;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -44,37 +47,80 @@ class ConversationController extends Controller
         ]);
     }
 
-public function createDirect(Request $request): JsonResponse
-{
-    $validated = $request->validate([
-        'user_id' => [
-            'required',
-            'integer',
-            'exists:users,id',
-            Rule::notIn([$request->user()->id]),
-        ],
-    ]);
+    public function createDirect(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'user_id' => [
+                'required',
+                'integer',
+                'exists:users,id',
+                Rule::notIn([$request->user()->id]),
+            ],
+        ]);
 
-    $otherUser = User::query()
-        ->where('id', $validated['user_id'])
-        ->where('is_active', true)
-        ->firstOrFail();
+        $otherUser = User::query()
+            ->where('id', $validated['user_id'])
+            ->where('is_active', true)
+            ->firstOrFail();
 
-    $authUserId = $request->user()->id;
+        $authUserId = $request->user()->id;
 
-    $existingConversationId = ConversationParticipant::query()
-        ->join('conversations', 'conversation_participants.conversation_id', '=', 'conversations.id')
-        ->where('conversations.type', 'direct')
-        ->whereNull('conversations.deleted_at')
-        ->whereNull('conversation_participants.left_at')
-        ->whereIn('conversation_participants.user_id', [$authUserId, $otherUser->id])
-        ->groupBy('conversation_participants.conversation_id')
-        ->havingRaw('COUNT(DISTINCT conversation_participants.user_id) = 2')
-        ->value('conversation_participants.conversation_id');
+        $existingConversationId = ConversationParticipant::query()
+            ->join('conversations', 'conversation_participants.conversation_id', '=', 'conversations.id')
+            ->where('conversations.type', 'direct')
+            ->whereNull('conversations.deleted_at')
+            ->whereNull('conversation_participants.left_at')
+            ->whereIn('conversation_participants.user_id', [$authUserId, $otherUser->id])
+            ->groupBy('conversation_participants.conversation_id')
+            ->havingRaw('COUNT(DISTINCT conversation_participants.user_id) = 2')
+            ->value('conversation_participants.conversation_id');
 
-    if ($existingConversationId) {
+        if ($existingConversationId) {
+            $participant = ConversationParticipant::query()
+                ->where('conversation_id', $existingConversationId)
+                ->where('user_id', $authUserId)
+                ->with([
+                    'conversation.participants.user:id,name,email,avatar_url',
+                    'conversation.lastMessageSender:id,name,email',
+                ])
+                ->firstOrFail();
+
+            return response()->json([
+                'message' => 'Direct conversation already exists.',
+                'data' => $this->conversationListItem($participant, $authUserId),
+            ]);
+        }
+
+        $conversation = DB::transaction(function () use ($request, $otherUser) {
+            $now = now();
+            $conversation = Conversation::query()->create([
+                'type' => 'direct',
+                'title' => null,
+                'created_by' => $request->user()->id,
+                'metadata' => null,
+            ]);
+
+            ConversationParticipant::query()->create([
+                'conversation_id' => $conversation->id,
+                'user_id' => $request->user()->id,
+                'role' => 'member',
+                'joined_at' => $now,
+            ]);
+
+            ConversationParticipant::query()->create([
+                'conversation_id' => $conversation->id,
+                'user_id' => $otherUser->id,
+                'role' => 'member',
+                'joined_at' => $now,
+            ]);
+
+            $this->createConversationUpdatedEvents($conversation, $now);
+
+            return $conversation;
+        });
+
         $participant = ConversationParticipant::query()
-            ->where('conversation_id', $existingConversationId)
+            ->where('conversation_id', $conversation->id)
             ->where('user_id', $authUserId)
             ->with([
                 'conversation.participants.user:id,name,email,avatar_url',
@@ -83,50 +129,11 @@ public function createDirect(Request $request): JsonResponse
             ->firstOrFail();
 
         return response()->json([
-            'message' => 'Direct conversation already exists.',
+            'message' => 'Direct conversation created successfully.',
             'data' => $this->conversationListItem($participant, $authUserId),
-        ]);
+        ], 201);
     }
 
-    $conversation = DB::transaction(function () use ($request, $otherUser) {
-        $conversation = Conversation::query()->create([
-            'type' => 'direct',
-            'title' => null,
-            'created_by' => $request->user()->id,
-            'metadata' => null,
-        ]);
-
-        ConversationParticipant::query()->create([
-            'conversation_id' => $conversation->id,
-            'user_id' => $request->user()->id,
-            'role' => 'member',
-            'joined_at' => now(),
-        ]);
-
-        ConversationParticipant::query()->create([
-            'conversation_id' => $conversation->id,
-            'user_id' => $otherUser->id,
-            'role' => 'member',
-            'joined_at' => now(),
-        ]);
-
-        return $conversation;
-    });
-
-    $participant = ConversationParticipant::query()
-        ->where('conversation_id', $conversation->id)
-        ->where('user_id', $authUserId)
-        ->with([
-            'conversation.participants.user:id,name,email,avatar_url',
-            'conversation.lastMessageSender:id,name,email',
-        ])
-        ->firstOrFail();
-
-    return response()->json([
-        'message' => 'Direct conversation created successfully.',
-        'data' => $this->conversationListItem($participant, $authUserId),
-    ], 201);
-}
     public function createGroup(Request $request): JsonResponse
     {
         $validated = $request->validate([
@@ -209,23 +216,49 @@ public function createDirect(Request $request): JsonResponse
             ], 422);
         }
 
-        if ($participant) {
-            $participant->update([
-                'role' => 'member',
-                'joined_at' => now(),
-                'left_at' => null,
-                'unread_count' => 0,
-                'last_read_at' => null,
-                'last_read_message_id' => null,
-            ]);
-        } else {
-            $participant = ConversationParticipant::query()->create([
-                'conversation_id' => $conversation->id,
-                'user_id' => $user->id,
-                'role' => 'member',
-                'joined_at' => now(),
-            ]);
-        }
+        $participant = DB::transaction(function () use ($participant, $conversation, $user, $request) {
+            $now = now();
+            $syncBroadcaster = app(ChatSyncEventBroadcaster::class);
+
+            if ($participant) {
+                $participant->update([
+                    'role' => 'member',
+                    'joined_at' => $now,
+                    'left_at' => null,
+                    'unread_count' => 0,
+                    'last_read_at' => null,
+                    'last_read_message_id' => null,
+                ]);
+            } else {
+                $participant = ConversationParticipant::query()->create([
+                    'conversation_id' => $conversation->id,
+                    'user_id' => $user->id,
+                    'role' => 'member',
+                    'joined_at' => $now,
+                ]);
+            }
+
+            $activeUserIds = $this->activeUserIds($conversation);
+
+            $syncBroadcaster->createForUsers(
+                userIds: $activeUserIds,
+                eventType: 'participant.added',
+                conversationId: $conversation->id,
+                messageId: null,
+                payload: [
+                    'conversation_id' => $conversation->id,
+                    'user_id' => $participant->user_id,
+                    'role' => $participant->role,
+                    'joined_at' => $participant->joined_at?->toISOString(),
+                    'added_by_user_id' => $request->user()->id,
+                ],
+                occurredAt: $now
+            );
+
+            $this->createConversationUpdatedEvents($conversation, $now);
+
+            return $participant;
+        });
 
         return response()->json([
             'message' => 'Member added successfully.',
@@ -270,9 +303,35 @@ public function createDirect(Request $request): JsonResponse
             ], 403);
         }
 
-        $targetParticipant->update([
-            'left_at' => now(),
-        ]);
+        DB::transaction(function () use ($conversation, $targetParticipant, $request): void {
+            $now = now();
+            $syncBroadcaster = app(ChatSyncEventBroadcaster::class);
+
+            $targetParticipant->update([
+                'left_at' => $now,
+            ]);
+
+            $userIds = collect($this->activeUserIds($conversation))
+                ->push($targetParticipant->user_id)
+                ->unique()
+                ->values();
+
+            $syncBroadcaster->createForUsers(
+                userIds: $userIds,
+                eventType: 'participant.removed',
+                conversationId: $conversation->id,
+                messageId: null,
+                payload: [
+                    'conversation_id' => $conversation->id,
+                    'user_id' => $targetParticipant->user_id,
+                    'removed_by_user_id' => $request->user()->id,
+                    'left_at' => $now->toISOString(),
+                ],
+                occurredAt: $now
+            );
+
+            $this->createConversationUpdatedEvents($conversation, $now);
+        });
 
         return response()->json([
             'message' => 'Member removed successfully.',
@@ -304,9 +363,33 @@ public function createDirect(Request $request): JsonResponse
             ]);
         }
 
-        $targetParticipant->update([
-            'role' => 'admin',
-        ]);
+        DB::transaction(function () use ($conversation, $targetParticipant, $request): void {
+            $now = now();
+            $syncBroadcaster = app(ChatSyncEventBroadcaster::class);
+
+            $targetParticipant->update([
+                'role' => 'admin',
+            ]);
+
+            $syncBroadcaster->createForUsers(
+                userIds: $this->activeUserIds($conversation),
+                eventType: 'participant.role_changed',
+                conversationId: $conversation->id,
+                messageId: null,
+                payload: [
+                    'conversation_id' => $conversation->id,
+                    'user_id' => $targetParticipant->user_id,
+                    'role' => 'admin',
+                    'changed_by_user_id' => $request->user()->id,
+                    'changed_at' => $now->toISOString(),
+                ],
+                occurredAt: $now
+            );
+
+            $this->createConversationUpdatedEvents($conversation, $now);
+        });
+
+        $targetParticipant->refresh();
 
         return response()->json([
             'message' => 'Member promoted to admin successfully.',
@@ -340,6 +423,7 @@ public function createDirect(Request $request): JsonResponse
         }
 
         $conversation = DB::transaction(function () use ($request, $type, $title, $memberIds) {
+            $now = now();
             $conversation = Conversation::query()->create([
                 'type' => $type,
                 'title' => $title,
@@ -351,7 +435,7 @@ public function createDirect(Request $request): JsonResponse
                 'conversation_id' => $conversation->id,
                 'user_id' => $request->user()->id,
                 'role' => 'owner',
-                'joined_at' => now(),
+                'joined_at' => $now,
             ]);
 
             foreach ($memberIds as $memberId) {
@@ -359,9 +443,11 @@ public function createDirect(Request $request): JsonResponse
                     'conversation_id' => $conversation->id,
                     'user_id' => $memberId,
                     'role' => 'member',
-                    'joined_at' => now(),
+                    'joined_at' => $now,
                 ]);
             }
+
+            $this->createConversationUpdatedEvents($conversation, $now);
 
             return $conversation;
         });
@@ -376,7 +462,7 @@ public function createDirect(Request $request): JsonResponse
             ->firstOrFail();
 
         return response()->json([
-            'message' => ucfirst($type) . ' conversation created successfully.',
+            'message' => ucfirst($type).' conversation created successfully.',
             'data' => $this->conversationListItem($participant, $request->user()->id),
         ], 201);
     }
@@ -440,5 +526,43 @@ public function createDirect(Request $request): JsonResponse
             ->where('user_id', $userId)
             ->whereNull('left_at')
             ->first();
+    }
+
+    private function activeUserIds(Conversation $conversation): array
+    {
+        return ConversationParticipant::query()
+            ->where('conversation_id', $conversation->id)
+            ->whereNull('left_at')
+            ->pluck('user_id')
+            ->all();
+    }
+
+    private function createConversationUpdatedEvents(
+        Conversation $conversation,
+        CarbonInterface $occurredAt,
+        ?int $messageId = null
+    ): void {
+        $syncBroadcaster = app(ChatSyncEventBroadcaster::class);
+        $payloadFactory = app(ConversationSyncPayload::class);
+
+        $participants = ConversationParticipant::query()
+            ->where('conversation_id', $conversation->id)
+            ->whereNull('left_at')
+            ->with([
+                'conversation.participants.user:id,name,email,avatar_url',
+                'conversation.lastMessageSender:id,name,email',
+            ])
+            ->get();
+
+        foreach ($participants as $participant) {
+            $syncBroadcaster->createForUser(
+                userId: $participant->user_id,
+                eventType: 'conversation.updated',
+                conversationId: $conversation->id,
+                messageId: $messageId,
+                payload: $payloadFactory->forParticipant($participant),
+                occurredAt: $occurredAt
+            );
+        }
     }
 }
