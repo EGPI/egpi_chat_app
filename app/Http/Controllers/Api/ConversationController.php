@@ -5,6 +5,8 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Conversation;
 use App\Models\ConversationParticipant;
+use App\Models\Message;
+use App\Models\MessageReceipt;
 use App\Models\User;
 use App\Services\ChatSyncEventBroadcaster;
 use App\Services\ConversationSyncPayload;
@@ -176,6 +178,39 @@ class ConversationController extends Controller
         );
     }
 
+    public function details(Request $request, Conversation $conversation): JsonResponse
+    {
+        $participant = $this->getActiveParticipant($conversation, $request->user()->id);
+
+        if (! $participant) {
+            return response()->json([
+                'message' => 'You are not a participant in this conversation.',
+            ], 403);
+        }
+
+        $conversation->load([
+            'participants' => fn ($query) => $query
+                ->whereNull('left_at')
+                ->orderBy('joined_at')
+                ->orderBy('id')
+                ->with('user:id,name,email,avatar_url,phone,is_active,last_seen_at'),
+        ]);
+
+        return response()->json([
+            'data' => [
+                'id' => $conversation->id,
+                'type' => $conversation->type,
+                'title' => $this->resolveConversationTitle($conversation, $request->user()->id),
+                'my_role' => $participant->role,
+                'created_at' => $conversation->created_at?->toISOString(),
+                'updated_at' => $conversation->updated_at?->toISOString(),
+                'participants' => $conversation->participants
+                    ->map(fn (ConversationParticipant $participant) => $this->participantDetails($participant))
+                    ->values(),
+            ],
+        ]);
+    }
+
     public function addMember(Request $request, Conversation $conversation): JsonResponse
     {
         $validated = $request->validate([
@@ -218,6 +253,7 @@ class ConversationController extends Controller
 
         $participant = DB::transaction(function () use ($participant, $conversation, $user, $request) {
             $now = now();
+            $actor = $request->user();
             $syncBroadcaster = app(ChatSyncEventBroadcaster::class);
 
             if ($participant) {
@@ -238,6 +274,8 @@ class ConversationController extends Controller
                 ]);
             }
 
+            $participant->load('user');
+
             $activeUserIds = $this->activeUserIds($conversation);
 
             $syncBroadcaster->createForUsers(
@@ -248,26 +286,37 @@ class ConversationController extends Controller
                 payload: [
                     'conversation_id' => $conversation->id,
                     'user_id' => $participant->user_id,
+                    'user_name' => $participant->user?->name,
+                    'user_email' => $participant->user?->email,
+                    'user_avatar_url' => $participant->user?->avatar_url,
                     'role' => $participant->role,
                     'joined_at' => $participant->joined_at?->toISOString(),
-                    'added_by_user_id' => $request->user()->id,
+                    'added_by_user_id' => $actor->id,
+                    'added_by_name' => $actor->name,
                 ],
                 occurredAt: $now
             );
 
-            $this->createConversationUpdatedEvents($conversation, $now);
+            $this->createSystemMessage(
+                conversation: $conversation,
+                actor: $actor,
+                body: "{$actor->name} added {$participant->user?->name}",
+                payload: [
+                    'system_type' => 'participant.added',
+                    'actor_user_id' => $actor->id,
+                    'actor_name' => $actor->name,
+                    'target_user_id' => $participant->user_id,
+                    'target_name' => $participant->user?->name,
+                ],
+                occurredAt: $now
+            );
 
             return $participant;
         });
 
         return response()->json([
             'message' => 'Member added successfully.',
-            'data' => [
-                'conversation_id' => $conversation->id,
-                'user_id' => $participant->user_id,
-                'role' => $participant->role,
-                'joined_at' => $participant->joined_at?->toISOString(),
-            ],
+            'data' => $this->memberResponse($participant),
         ], 201);
     }
 
@@ -303,8 +352,11 @@ class ConversationController extends Controller
             ], 403);
         }
 
+        $targetParticipant->load('user');
+
         DB::transaction(function () use ($conversation, $targetParticipant, $request): void {
             $now = now();
+            $actor = $request->user();
             $syncBroadcaster = app(ChatSyncEventBroadcaster::class);
 
             $targetParticipant->update([
@@ -324,17 +376,34 @@ class ConversationController extends Controller
                 payload: [
                     'conversation_id' => $conversation->id,
                     'user_id' => $targetParticipant->user_id,
-                    'removed_by_user_id' => $request->user()->id,
+                    'user_name' => $targetParticipant->user?->name,
+                    'removed_by_user_id' => $actor->id,
+                    'removed_by_name' => $actor->name,
                     'left_at' => $now->toISOString(),
                 ],
                 occurredAt: $now
             );
 
-            $this->createConversationUpdatedEvents($conversation, $now);
+            $this->createSystemMessage(
+                conversation: $conversation,
+                actor: $actor,
+                body: "{$actor->name} removed {$targetParticipant->user?->name}",
+                payload: [
+                    'system_type' => 'participant.removed',
+                    'actor_user_id' => $actor->id,
+                    'actor_name' => $actor->name,
+                    'target_user_id' => $targetParticipant->user_id,
+                    'target_name' => $targetParticipant->user?->name,
+                ],
+                occurredAt: $now
+            );
         });
+
+        $targetParticipant->refresh()->load('user');
 
         return response()->json([
             'message' => 'Member removed successfully.',
+            'data' => $this->memberResponse($targetParticipant),
         ]);
     }
 
@@ -358,13 +427,19 @@ class ConversationController extends Controller
         }
 
         if ($targetParticipant->role === 'admin') {
+            $targetParticipant->load('user');
+
             return response()->json([
                 'message' => 'User is already an admin.',
+                'data' => $this->memberResponse($targetParticipant),
             ]);
         }
 
+        $targetParticipant->load('user');
+
         DB::transaction(function () use ($conversation, $targetParticipant, $request): void {
             $now = now();
+            $actor = $request->user();
             $syncBroadcaster = app(ChatSyncEventBroadcaster::class);
 
             $targetParticipant->update([
@@ -379,25 +454,36 @@ class ConversationController extends Controller
                 payload: [
                     'conversation_id' => $conversation->id,
                     'user_id' => $targetParticipant->user_id,
+                    'user_name' => $targetParticipant->user?->name,
                     'role' => 'admin',
-                    'changed_by_user_id' => $request->user()->id,
+                    'changed_by_user_id' => $actor->id,
+                    'changed_by_name' => $actor->name,
                     'changed_at' => $now->toISOString(),
                 ],
                 occurredAt: $now
             );
 
-            $this->createConversationUpdatedEvents($conversation, $now);
+            $this->createSystemMessage(
+                conversation: $conversation,
+                actor: $actor,
+                body: "{$actor->name} promoted {$targetParticipant->user?->name} to admin",
+                payload: [
+                    'system_type' => 'participant.role_changed',
+                    'actor_user_id' => $actor->id,
+                    'actor_name' => $actor->name,
+                    'target_user_id' => $targetParticipant->user_id,
+                    'target_name' => $targetParticipant->user?->name,
+                    'role' => 'admin',
+                ],
+                occurredAt: $now
+            );
         });
 
-        $targetParticipant->refresh();
+        $targetParticipant->refresh()->load('user');
 
         return response()->json([
             'message' => 'Member promoted to admin successfully.',
-            'data' => [
-                'conversation_id' => $conversation->id,
-                'user_id' => $targetParticipant->user_id,
-                'role' => $targetParticipant->role,
-            ],
+            'data' => $this->memberResponse($targetParticipant),
         ]);
     }
 
@@ -497,6 +583,138 @@ class ConversationController extends Controller
         return $otherParticipant?->user?->name
             ?? $otherParticipant?->user?->email
             ?? 'Direct chat';
+    }
+
+    private function participantDetails(ConversationParticipant $participant): array
+    {
+        $user = $participant->user;
+
+        return [
+            'user_id' => $participant->user_id,
+            'name' => $user?->name,
+            'email' => $user?->email,
+            'avatar_url' => $user?->avatar_url,
+            'phone' => $user?->phone,
+            'is_active' => (bool) $user?->is_active,
+            'last_seen_at' => $user?->last_seen_at?->toISOString(),
+            'role' => $participant->role,
+            'joined_at' => $participant->joined_at?->toISOString(),
+        ];
+    }
+
+    private function memberResponse(ConversationParticipant $participant): array
+    {
+        $user = $participant->user;
+
+        return [
+            'conversation_id' => $participant->conversation_id,
+            'user_id' => $participant->user_id,
+            'name' => $user?->name,
+            'email' => $user?->email,
+            'avatar_url' => $user?->avatar_url,
+            'phone' => $user?->phone,
+            'is_active' => (bool) $user?->is_active,
+            'last_seen_at' => $user?->last_seen_at?->toISOString(),
+            'role' => $participant->role,
+            'joined_at' => $participant->joined_at?->toISOString(),
+            'left_at' => $participant->left_at?->toISOString(),
+        ];
+    }
+
+    private function createSystemMessage(
+        Conversation $conversation,
+        User $actor,
+        string $body,
+        array $payload,
+        CarbonInterface $occurredAt
+    ): Message {
+        $message = Message::query()->create([
+            'conversation_id' => $conversation->id,
+            'sender_id' => $actor->id,
+            'client_message_id' => null,
+            'type' => 'system',
+            'body' => $body,
+            'payload' => $payload,
+            'reply_to_message_id' => null,
+            'server_received_at' => $occurredAt,
+            'sent_at' => $occurredAt,
+        ]);
+
+        $activeParticipants = ConversationParticipant::query()
+            ->where('conversation_id', $conversation->id)
+            ->whereNull('left_at')
+            ->get();
+
+        foreach ($activeParticipants as $participant) {
+            if ($participant->user_id === $actor->id) {
+                continue;
+            }
+
+            MessageReceipt::query()->create([
+                'message_id' => $message->id,
+                'conversation_id' => $conversation->id,
+                'user_id' => $participant->user_id,
+                'delivered_at' => null,
+                'read_at' => null,
+            ]);
+
+            $participant->increment('unread_count');
+        }
+
+        $conversation->update([
+            'last_message_id' => $message->id,
+            'last_message_sender_id' => $actor->id,
+            'last_message_preview' => $this->makePreview($body),
+            'last_message_at' => $occurredAt,
+        ]);
+
+        $message->load('sender:id,name,email');
+
+        $syncBroadcaster = app(ChatSyncEventBroadcaster::class);
+
+        foreach ($activeParticipants as $participant) {
+            $syncBroadcaster->createForUser(
+                userId: $participant->user_id,
+                eventType: 'message.created',
+                conversationId: $conversation->id,
+                messageId: $message->id,
+                payload: $this->systemMessageSyncPayload($message),
+                occurredAt: $occurredAt
+            );
+        }
+
+        $this->createConversationUpdatedEvents($conversation, $occurredAt, $message->id);
+
+        return $message;
+    }
+
+    private function systemMessageSyncPayload(Message $message): array
+    {
+        return [
+            'id' => $message->id,
+            'message_id' => $message->id,
+            'conversation_id' => $message->conversation_id,
+            'sender_id' => $message->sender_id,
+            'client_message_id' => $message->client_message_id,
+            'type' => $message->type,
+            'body' => $message->body,
+            'payload' => $message->payload,
+            'server_received_at' => $message->server_received_at?->toISOString(),
+            'sent_at' => $message->sent_at?->toISOString(),
+            'created_at' => $message->created_at?->toISOString(),
+            'updated_at' => $message->updated_at?->toISOString(),
+            'status' => 'sent',
+            'sender' => $message->sender ? [
+                'id' => $message->sender->id,
+                'name' => $message->sender->name,
+                'email' => $message->sender->email,
+            ] : null,
+        ];
+    }
+
+    private function makePreview(string $body): string
+    {
+        return mb_strimwidth($body, 0, 120, '...');
     }
 
     private function ensureGroupOrAnnouncement(Conversation $conversation): void

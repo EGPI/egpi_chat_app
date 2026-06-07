@@ -21,6 +21,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/conversations/group', [ConversationController::class, 'createGroup']);
     Route::post('/conversations/announcement', [ConversationController::class, 'createAnnouncement']);
 
+    Route::get('/conversations/{conversation}/details', [ConversationController::class, 'details']);
     Route::post('/conversations/{conversation}/members', [ConversationController::class, 'addMember']);
     Route::delete('/conversations/{conversation}/members/{user}', [ConversationController::class, 'removeMember']);
     Route::post('/conversations/{conversation}/admins/{user}', [ConversationController::class, 'promoteMember']);

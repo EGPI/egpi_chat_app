@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\SyncEvent;
+use App\Services\ChatSyncEventBroadcaster;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
@@ -51,16 +52,12 @@ class SyncController extends Controller
 
         $nextEventId = $events->last()?->id ?? $afterEventId;
 
+        $syncBroadcaster = app(ChatSyncEventBroadcaster::class);
+
         return response()->json([
-            'events' => $events->map(fn (SyncEvent $event) => [
-                'id' => $event->id,
-                'event_type' => $event->event_type,
-                'conversation_id' => $event->conversation_id,
-                'message_id' => $event->message_id,
-                'payload' => $event->payload,
-                'occurred_at' => $event->occurred_at?->toISOString(),
-                'created_at' => $event->created_at?->toISOString(),
-            ])->values(),
+            'events' => $events
+                ->map(fn (SyncEvent $event) => $syncBroadcaster->envelope($event))
+                ->values(),
             'next_event_id' => $nextEventId,
             'has_more' => $hasMore,
         ]);
