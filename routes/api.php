@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\Api\AuthController;
+use App\Http\Controllers\Api\CallController;
 use App\Http\Controllers\Api\SyncController;
 use App\Http\Controllers\Api\MessageController;
 use App\Http\Controllers\Api\ConversationController;
@@ -28,6 +29,13 @@ Route::middleware('auth:sanctum')->group(function () {
 
     Route::post('/conversations/{conversation}/messages', [MessageController::class, 'store']);
     Route::get('/conversations/{conversation}/messages', [MessageController::class, 'index']);
+
+    Route::post('/conversations/{conversation}/calls/audio/start', [CallController::class, 'startAudio']);
+    Route::post('/calls/{call}/accept', [CallController::class, 'accept']);
+    Route::post('/calls/{call}/reject', [CallController::class, 'reject']);
+    Route::post('/calls/{call}/end', [CallController::class, 'end']);
+    Route::post('/calls/{call}/signal', [CallController::class, 'signal']);
+    Route::get('/calls/{call}', [CallController::class, 'show']);
 
     Route::post('/messages/{message}/delivered', [MessageController::class, 'markDelivered']);
     Route::post('/conversations/{conversation}/read', [MessageController::class, 'markConversationRead']);
