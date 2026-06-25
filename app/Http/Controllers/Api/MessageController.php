@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Jobs\SendMessagePushNotification;
 use App\Models\Conversation;
 use App\Models\ConversationParticipant;
 use App\Models\Message;
@@ -197,6 +198,8 @@ class MessageController extends Controller
             'sender:id,name,email',
             'receipts:id,message_id,user_id,delivered_at,read_at',
         ]);
+
+        $this->dispatchPushNotifications($message);
 
         return response()->json([
             'message' => 'Message sent successfully.',
@@ -579,5 +582,15 @@ class MessageController extends Controller
     private function conversationUpdatedPayload(ConversationParticipant $participant): array
     {
         return app(ConversationSyncPayload::class)->forParticipant($participant);
+    }
+
+    private function dispatchPushNotifications(Message $message): void
+    {
+        ConversationParticipant::query()
+            ->where('conversation_id', $message->conversation_id)
+            ->whereNull('left_at')
+            ->where('user_id', '!=', $message->sender_id)
+            ->pluck('user_id')
+            ->each(fn (int $userId) => SendMessagePushNotification::dispatch($message->id, $userId));
     }
 }
